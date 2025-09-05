@@ -62,8 +62,8 @@ public class DtlnaecProcessor
             var stateShape1 = _session1.InputMetadata[_inputNames1[1]].Dimensions;
             var stateShape2 = _session2.InputMetadata[_inputNames2[1]].Dimensions;
 
-            _states1 = new DenseTensor<float>(stateShape1);
-            _states2 = new DenseTensor<float>(stateShape2);
+            _states1 = new DenseTensor<float>(new ReadOnlySpan<int>(stateShape1.ToArray()), false);
+            _states2 = new DenseTensor<float>(new ReadOnlySpan<int>(stateShape2.ToArray()), false);
 
             // Reset states
             ResetStates();
@@ -223,7 +223,7 @@ public class DtlnaecProcessor
         };
 
         using var outputs2 = _session2.Run(inputs2);
-        var outBlock = outputs2.First(v => v.Name == _outputNames2[0]).AsTensor<float>();
+        var outBlock = outputs2.First(v => v.Name == _outputNames2[0]).AsTensor<float>() as DenseTensor<float>;
         _states2 = outputs2.First(v => v.Name == _outputNames2[1]).AsTensor<float>().ToDenseTensor();
 
         // --- Overlap-Add ---
