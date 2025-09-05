@@ -1,0 +1,7 @@
+
+.vsconfig
+Library
+Logs
+Temp
+*.sln
+*.dwlt
