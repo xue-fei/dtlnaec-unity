@@ -7,6 +7,8 @@ public class RealTest : MonoBehaviour
     DtlnaecProcessor2 dtlnaecProcessor;
     public MicrophoneWebGL microphoneWebGL;
     bool isPlay = false;
+    List<float> mic = new List<float>();
+    List<float> lpb = new List<float>();
     List<float> output = new List<float>();
 
     // Start is called before the first frame update
@@ -31,6 +33,7 @@ public class RealTest : MonoBehaviour
     float[] temp = new float[128];
     void OnData(float[] data)
     {
+        mic.AddRange(data);
         if (farQueue.Count >= 128)
         {
             for (int i = 0; i < temp.Length; i++)
@@ -48,10 +51,10 @@ public class RealTest : MonoBehaviour
     {
         if (isPlay)
         {
-            Debug.Log(data.Length);
+            lpb.AddRange(data);
             for (int i = 0; i < data.Length; i++)
             {
-                data[i] = data[i] * 0.5f;
+                data[i] = data[i] * 0.25f;
                 farQueue.Enqueue(data[i]);
             }
         }
@@ -64,6 +67,8 @@ public class RealTest : MonoBehaviour
             float[] end = dtlnaecProcessor.Flush();
             output.AddRange(end);
             Util.SaveClip(1, 16000, output.ToArray(), Application.dataPath + "/output.wav");
+            Util.SaveClip(1, 16000, mic.ToArray(), Application.dataPath + "/mic.wav");
+            Util.SaveClip(1, 16000, lpb.ToArray(), Application.dataPath + "/lpb.wav");
         }
         isPlay = false;
     }
