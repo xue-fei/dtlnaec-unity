@@ -6,6 +6,7 @@ public class RealTest : MonoBehaviour
 {
     DtlnaecProcessor2 dtlnaecProcessor;
     public MicrophoneWebGL microphoneWebGL;
+    public AudioSource audioSource;
     bool isPlay = false;
     List<float> mic = new List<float>();
     List<float> lpb = new List<float>();
@@ -14,6 +15,14 @@ public class RealTest : MonoBehaviour
     // Start is called before the first frame update
     void Start()
     {
+        AudioConfiguration config = AudioSettings.GetConfiguration();
+        config.sampleRate = 16000;
+        config.speakerMode = AudioSpeakerMode.Stereo;
+        config.dspBufferSize = 256;
+        AudioSettings.Reset(config);
+
+        audioSource.Play();
+
         dtlnaecProcessor = new DtlnaecProcessor2();
         dtlnaecProcessor.Initialize(Application.streamingAssetsPath + "/dtln_aec_128_1.onnx",
             Application.streamingAssetsPath + "/dtln_aec_128_2.onnx");
@@ -46,16 +55,30 @@ public class RealTest : MonoBehaviour
     }
 
     Queue<float> farQueue = new Queue<float>();
+    float[] tempData = new float[256];
 
     private void OnAudioFilterRead(float[] data, int channels)
     {
         if (isPlay)
         {
-            lpb.AddRange(data);
-            for (int i = 0; i < data.Length; i++)
+            Debug.Log(data.Length);
+            if (channels == 1)
             {
-                data[i] = data[i] * 0.25f;
-                farQueue.Enqueue(data[i]);
+                tempData = data;
+            }
+            if (channels == 2)
+            {
+                for (int i = 0; i < tempData.Length; i++)
+                {
+                    tempData[i] = data[i * 2];
+                }
+            }
+
+            lpb.AddRange(tempData);
+            for (int i = 0; i < tempData.Length; i++)
+            {
+                tempData[i] = tempData[i] * 0.25f;
+                farQueue.Enqueue(tempData[i]);
             }
         }
     }

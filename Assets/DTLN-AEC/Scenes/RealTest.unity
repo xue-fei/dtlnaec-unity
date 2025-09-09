@@ -149,9 +149,9 @@ AudioSource:
   m_GameObject: {fileID: 641028067}
   m_Enabled: 1
   serializedVersion: 4
-  OutputAudioMixerGroup: {fileID: 0}
+  OutputAudioMixerGroup: {fileID: 24300002, guid: cb50461b405e076468375825880f100b, type: 2}
   m_audioClip: {fileID: 8300000, guid: 18894d485d779f745a2d5f2dd7a5ceb1, type: 3}
-  m_PlayOnAwake: 1
+  m_PlayOnAwake: 0
   m_Volume: 1
   m_Pitch: 1
   Loop: 1
@@ -444,6 +444,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   microphoneWebGL: {fileID: 1720984879}
+  audioSource: {fileID: 641028068}
 --- !u!114 &1720984879
 MonoBehaviour:
   m_ObjectHideFlags: 0
