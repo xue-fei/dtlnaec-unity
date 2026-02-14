@@ -16,6 +16,8 @@ public class DtlnaecProcessor2
     private const int RequiredSampleRate = 16000;
     // RFFT returns (N/2)+1 complex numbers
     private const int FftHalfSize = (FftSize / 2) + 1;
+    // Padding size (block_len - block_shift)
+    private const int PaddingSize = BlockLen - BlockShift; // 384
 
     // ONNX session instances
     private InferenceSession _session1;
@@ -31,14 +33,18 @@ public class DtlnaecProcessor2
     private List<string> _inputNames2;
     private List<string> _outputNames2;
 
-    // Buffers for real-time processing
+    // Buffers for real-time processing (与Python一致的滑动窗口)
     private float[] _inputBuffer = new float[BlockLen];
     private float[] _lpbBuffer = new float[BlockLen];
     private float[] _outputBuffer = new float[BlockLen];
-    private int _bufferPosition = 0;
 
     // Frame counter for tracking processing state
     private int _framesProcessed = 0;
+
+    // 用于累积padding帧
+    private bool _isPaddingPhase = true;
+    private int _paddingFramesReceived = 0;
+    private const int PaddingFrames = PaddingSize / BlockShift; // 384/128 = 3 frames
 
     public bool Initialize(string model1Path, string model2Path)
     {
@@ -94,57 +100,65 @@ public class DtlnaecProcessor2
             _states2.Buffer.Span.Clear();
         }
 
-        // Reset buffers
+        // Reset buffers - 初始化为全零（相当于Python的padding）
         Array.Clear(_inputBuffer, 0, _inputBuffer.Length);
         Array.Clear(_lpbBuffer, 0, _lpbBuffer.Length);
         Array.Clear(_outputBuffer, 0, _outputBuffer.Length);
-        _bufferPosition = 0;
+
         _framesProcessed = 0;
+        _isPaddingPhase = true;
+        _paddingFramesReceived = 0;
     }
 
     /// <summary>
     /// Process a frame of audio data for real-time streaming
+    /// 完全按照Python逻辑实现的滑动窗口处理
     /// </summary>
     /// <param name="micFrame">Microphone audio frame (must be BlockShift samples)</param>
     /// <param name="lpbFrame">Loudspeaker audio frame (must be BlockShift samples)</param>
-    /// <returns>Processed audio frame (BlockShift samples) or null if not enough data</returns>
+    /// <returns>Processed audio frame (BlockShift samples)</returns>
     public float[] ProcessFrame(float[] micFrame, float[] lpbFrame)
     {
         if (micFrame.Length != BlockShift || lpbFrame.Length != BlockShift)
         {
             Debug.LogError($"Input frames must be exactly {BlockShift} samples");
-            return null;
+            return new float[BlockShift];
         }
 
         if (_session1 == null || _session2 == null)
         {
             Debug.LogError("DTLN-AEC processor not initialized");
-            return null;
-        }
-
-        // Add new data to buffers
-        Array.Copy(micFrame, 0, _inputBuffer, _bufferPosition, BlockShift);
-        Array.Copy(lpbFrame, 0, _lpbBuffer, _bufferPosition, BlockShift);
-        _bufferPosition += BlockShift;
-
-        // Check if we have enough data for processing
-        if (_bufferPosition < BlockLen)
-        {
-            // Not enough data yet, return silent frame
             return new float[BlockShift];
         }
 
-        // Process the block
-        float[] processedBlock = ProcessBlock(_inputBuffer, _lpbBuffer);
+        // 前3帧作为padding（模拟Python的初始padding）
+        if (_isPaddingPhase)
+        {
+            _paddingFramesReceived++;
+            if (_paddingFramesReceived >= PaddingFrames)
+            {
+                _isPaddingPhase = false;
+            }
+            // padding阶段返回静音
+            return new float[BlockShift];
+        }
 
-        // Shift buffers for next iteration
+        // === 滑动窗口更新（与Python完全一致） ===
+        // Python: in_buffer[:-block_shift] = in_buffer[block_shift:]
         Array.Copy(_inputBuffer, BlockShift, _inputBuffer, 0, BlockLen - BlockShift);
         Array.Copy(_lpbBuffer, BlockShift, _lpbBuffer, 0, BlockLen - BlockShift);
-        _bufferPosition = BlockLen - BlockShift;
 
-        // Extract the output frame (first BlockShift samples)
+        // Python: in_buffer[-block_shift:] = audio[idx * block_shift : (idx * block_shift) + block_shift]
+        Array.Copy(micFrame, 0, _inputBuffer, BlockLen - BlockShift, BlockShift);
+        Array.Copy(lpbFrame, 0, _lpbBuffer, BlockLen - BlockShift, BlockShift);
+
+        // === 处理完整的block ===
+        ProcessBlock(_inputBuffer, _lpbBuffer);
+
+        // === 提取输出（从overlap-add buffer的前BlockShift个样本） ===
+        // Python: out_file[idx * block_shift : (idx * block_shift) + block_shift] = out_buffer[:block_shift]
         float[] outputFrame = new float[BlockShift];
-        Array.Copy(processedBlock, 0, outputFrame, 0, BlockShift);
+        Array.Copy(_outputBuffer, 0, outputFrame, 0, BlockShift);
 
         _framesProcessed++;
         return outputFrame;
@@ -153,37 +167,29 @@ public class DtlnaecProcessor2
     /// <summary>
     /// Process any remaining audio in the buffers (for end of stream)
     /// </summary>
-    /// <returns>Processed audio frames or null if no data</returns>
     public float[] Flush()
     {
-        if (_bufferPosition == 0)
-            return null;
+        // 处理最后的padding帧
+        List<float> finalOutput = new List<float>();
 
-        // Pad with zeros to complete the block
-        Array.Clear(_inputBuffer, _bufferPosition, BlockLen - _bufferPosition);
-        Array.Clear(_lpbBuffer, _bufferPosition, BlockLen - _bufferPosition);
+        // 输出剩余的PaddingFrames帧
+        for (int i = 0; i < PaddingFrames; i++)
+        {
+            float[] zeroFrame = new float[BlockShift];
+            float[] output = ProcessFrame(zeroFrame, zeroFrame);
+            finalOutput.AddRange(output);
+        }
 
-        // Process the final block
-        float[] processedBlock = ProcessBlock(_inputBuffer, _lpbBuffer);
-
-        // Reset buffer position
-        _bufferPosition = 0;
-
-        // Return the valid portion of the processed block
-        int validSamples = Math.Min(BlockShift, _bufferPosition);
-        float[] output = new float[validSamples];
-        Array.Copy(processedBlock, 0, output, 0, validSamples);
-
-        return output;
+        return finalOutput.ToArray();
     }
 
-    private float[] ProcessBlock(float[] inputBlock, float[] lpbBlock)
+    private void ProcessBlock(float[] inputBlock, float[] lpbBlock)
     {
-        // --- FFT ---
+        // === 1. FFT计算 ===
         var inBlockFft = PerformRfft(inputBlock);
         var lpbBlockFft = PerformRfft(lpbBlock);
 
-        // Calculate magnitude for model 1 input
+        // === 2. 计算幅度谱 ===
         var inMag = new DenseTensor<float>(dimensions: new[] { 1, 1, FftHalfSize });
         var lpbMag = new DenseTensor<float>(dimensions: new[] { 1, 1, FftHalfSize });
 
@@ -193,7 +199,7 @@ public class DtlnaecProcessor2
             lpbMag[0, 0, i] = (float)lpbBlockFft[i].Magnitude;
         }
 
-        // --- Run Model 1 ---
+        // === 3. 运行Model 1 ===
         var inputs1 = new List<NamedOnnxValue>
         {
             NamedOnnxValue.CreateFromTensor(_inputNames1[0], inMag),
@@ -201,22 +207,25 @@ public class DtlnaecProcessor2
             NamedOnnxValue.CreateFromTensor(_inputNames1[1], _states1)
         };
 
-        using var outputs1 = _session1.Run(inputs1);
-        var outMask = outputs1.First(v => v.Name == _outputNames1[0]).AsTensor<float>();
-        _states1 = outputs1.First(v => v.Name == _outputNames1[1]).AsTensor<float>().ToDenseTensor();
-
-        // --- Apply Mask and IFFT ---
-        for (int i = 0; i < FftHalfSize; i++)
+        using (var outputs1 = _session1.Run(inputs1))
         {
-            inBlockFft[i] = new Complex(
-                inBlockFft[i].Real * outMask[0, 0, i],
-                inBlockFft[i].Imaginary * outMask[0, 0, i]
-            );
+            var outMask = outputs1.First(v => v.Name == _outputNames1[0]).AsTensor<float>();
+            _states1 = outputs1.First(v => v.Name == _outputNames1[1]).AsTensor<float>().ToDenseTensor();
+
+            // === 4. 应用mask并执行IFFT ===
+            for (int i = 0; i < FftHalfSize; i++)
+            {
+                float maskValue = outMask[0, 0, i];
+                inBlockFft[i] = new Complex(
+                    inBlockFft[i].Real * maskValue,
+                    inBlockFft[i].Imaginary * maskValue
+                );
+            }
         }
 
         var estimatedBlockTime = PerformIrfft(inBlockFft);
 
-        // --- Run Model 2 ---
+        // === 5. 准备Model 2的输入 ===
         var estimatedBlockTensor = new DenseTensor<float>(dimensions: new[] { 1, 1, BlockLen });
         var inLpbTensor = new DenseTensor<float>(dimensions: new[] { 1, 1, BlockLen });
 
@@ -226,6 +235,7 @@ public class DtlnaecProcessor2
             inLpbTensor[0, 0, i] = lpbBlock[i];
         }
 
+        // === 6. 运行Model 2 ===
         var inputs2 = new List<NamedOnnxValue>
         {
             NamedOnnxValue.CreateFromTensor(_inputNames2[0], estimatedBlockTensor),
@@ -233,24 +243,24 @@ public class DtlnaecProcessor2
             NamedOnnxValue.CreateFromTensor(_inputNames2[1], _states2)
         };
 
-        using var outputs2 = _session2.Run(inputs2);
-        var outBlock = outputs2.First(v => v.Name == _outputNames2[0]).AsTensor<float>() as DenseTensor<float>;
-        _states2 = outputs2.First(v => v.Name == _outputNames2[1]).AsTensor<float>().ToDenseTensor();
-
-        // Apply overlap-add to output buffer
-        Array.Copy(_outputBuffer, BlockShift, _outputBuffer, 0, BlockLen - BlockShift);
-        Array.Clear(_outputBuffer, BlockLen - BlockShift, BlockShift);
-
-        var outBlockSpan = outBlock.Buffer.Span;
-        for (int i = 0; i < BlockLen; i++)
+        using (var outputs2 = _session2.Run(inputs2))
         {
-            _outputBuffer[i] += outBlockSpan[i];
-        }
+            var outBlock = outputs2.First(v => v.Name == _outputNames2[0]).AsTensor<float>() as DenseTensor<float>;
+            _states2 = outputs2.First(v => v.Name == _outputNames2[1]).AsTensor<float>().ToDenseTensor();
 
-        // Return a copy of the output buffer
-        float[] result = new float[BlockLen];
-        Array.Copy(_outputBuffer, result, BlockLen);
-        return result;
+            // === 7. Overlap-Add处理（与Python完全一致） ===
+            // Python: out_buffer[:-block_shift] = out_buffer[block_shift:]
+            Array.Copy(_outputBuffer, BlockShift, _outputBuffer, 0, BlockLen - BlockShift);
+            // Python: out_buffer[-block_shift:] = np.zeros((block_shift))
+            Array.Clear(_outputBuffer, BlockLen - BlockShift, BlockShift);
+
+            // Python: out_buffer += np.squeeze(out_block)
+            var outBlockSpan = outBlock.Buffer.Span;
+            for (int i = 0; i < BlockLen; i++)
+            {
+                _outputBuffer[i] += outBlockSpan[i];
+            }
+        }
     }
 
     private Complex[] PerformRfft(float[] input)
@@ -276,7 +286,7 @@ public class DtlnaecProcessor2
         var fullSpectrum = new Complex[FftSize];
         Array.Copy(input, fullSpectrum, FftHalfSize);
 
-        // Fill the second half with complex conjugates
+        // Fill the second half with complex conjugates (for real signal)
         for (int i = 1; i < FftHalfSize - 1; i++)
         {
             fullSpectrum[FftSize - i] = Complex.Conjugate(input[i]);
@@ -304,5 +314,5 @@ public class DtlnaecProcessor2
 
     // Properties for monitoring
     public int FramesProcessed => _framesProcessed;
-    public int BufferFill => _bufferPosition;
+    public bool IsPaddingPhase => _isPaddingPhase;
 }
