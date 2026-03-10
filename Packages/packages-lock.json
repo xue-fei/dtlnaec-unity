@@ -1,18 +1,11 @@
 {
   "dependencies": {
     "ai.onnxruntime": {
-      "version": "https://github.com/xue-fei/onnxruntime-unity.git",
+      "version": "https://github.com/xue-fei/onnxruntime-unity-cpu.git",
       "depth": 0,
       "source": "git",
       "dependencies": {},
-      "hash": "99b49409968ac0bbd9b75efda5a4d6769b87f778"
-    },
-    "com.hecomi.umicrophonewebgl": {
-      "version": "https://gitee.com/awnuxcvbn/uMicrophoneWebGL.git",
-      "depth": 0,
-      "source": "git",
-      "dependencies": {},
-      "hash": "0b47ef8b66a5eed741226a37ff8acd677f040dc6"
+      "hash": "bbcfd54a37ea7040984a811f723a04fbd2cf3407"
     },
     "com.unity.ext.nunit": {
       "version": "1.0.6",

@@ -7,7 +7,7 @@ using Microsoft.ML.OnnxRuntime.Tensors;
 using MathNet.Numerics.IntegralTransforms;
 using UnityEngine;
 
-public class DtlnaecProcessor2
+public class RuntimeProcessor
 {
     // Constants from the Python script
     private const int BlockLen = 512;

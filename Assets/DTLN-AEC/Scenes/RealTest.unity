@@ -133,6 +133,7 @@ GameObject:
   m_Component:
   - component: {fileID: 641028069}
   - component: {fileID: 641028068}
+  - component: {fileID: 641028070}
   m_Layer: 0
   m_Name: Audio Source
   m_TagString: Untagged
@@ -149,9 +150,9 @@ AudioSource:
   m_GameObject: {fileID: 641028067}
   m_Enabled: 1
   serializedVersion: 4
-  OutputAudioMixerGroup: {fileID: 24300002, guid: cb50461b405e076468375825880f100b, type: 2}
-  m_audioClip: {fileID: 8300000, guid: a742e69054ed9bf4f85cfdcccd5330c5, type: 3}
-  m_PlayOnAwake: 0
+  OutputAudioMixerGroup: {fileID: 0}
+  m_audioClip: {fileID: 8300000, guid: 18894d485d779f745a2d5f2dd7a5ceb1, type: 3}
+  m_PlayOnAwake: 1
   m_Volume: 1
   m_Pitch: 1
   Loop: 1
@@ -251,6 +252,18 @@ Transform:
   m_Father: {fileID: 0}
   m_RootOrder: 2
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &641028070
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 641028067}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 05bf77367542d1a44a0f1df628e2c946, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
 --- !u!1 &1448912590
 GameObject:
   m_ObjectHideFlags: 0
@@ -357,7 +370,6 @@ GameObject:
   - component: {fileID: 1720984876}
   - component: {fileID: 1720984875}
   - component: {fileID: 1720984878}
-  - component: {fileID: 1720984879}
   m_Layer: 0
   m_Name: Main Camera
   m_TagString: MainCamera
@@ -440,38 +452,6 @@ MonoBehaviour:
   m_GameObject: {fileID: 1720984874}
   m_Enabled: 1
   m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: d9a4320faca080745a125fbee90428a4, type: 3}
+  m_Script: {fileID: 11500000, guid: 1c7b9d4a1a4143d459e7b975538f06d9, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  microphoneWebGL: {fileID: 1720984879}
-  audioSource: {fileID: 641028068}
---- !u!114 &1720984879
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1720984874}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 65bfef609686d44c69d900c6e5df8ba0, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  isAutoStart: 0
-  micIndex: 0
-  bufferSize: 256
-  readyEvent:
-    m_PersistentCalls:
-      m_Calls: []
-  startEvent:
-    m_PersistentCalls:
-      m_Calls: []
-  stopEvent:
-    m_PersistentCalls:
-      m_Calls: []
-  deviceListEvent:
-    m_PersistentCalls:
-      m_Calls: []
-  dataEvent:
-    m_PersistentCalls:
-      m_Calls: []
