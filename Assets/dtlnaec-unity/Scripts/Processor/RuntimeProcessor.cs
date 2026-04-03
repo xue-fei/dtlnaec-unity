@@ -41,9 +41,10 @@ public class RuntimeProcessor
     // Frame counter for tracking processing state
     private int _framesProcessed = 0;
 
-    // 用于累积padding帧
-    private bool _isPaddingPhase = true;
-    private int _paddingFramesReceived = 0;
+    // 输出延迟补偿：前 PaddingFrames 帧的输出对应的是 zero-padding 区域，需丢弃
+    // 与 FileProcessor 的行为完全对齐：FileProcessor 从 outFile[BlockLen-BlockShift] 开始取结果，
+    // 即跳过了前 3 帧（PaddingFrames）的输出。
+    private int _outputDelayFrames = 0;
     private const int PaddingFrames = PaddingSize / BlockShift; // 384/128 = 3 frames
 
     public bool Initialize(string model1Path, string model2Path)
@@ -106,17 +107,27 @@ public class RuntimeProcessor
         Array.Clear(_outputBuffer, 0, _outputBuffer.Length);
 
         _framesProcessed = 0;
-        _isPaddingPhase = true;
-        _paddingFramesReceived = 0;
+        _outputDelayFrames = 0;
     }
 
     /// <summary>
-    /// Process a frame of audio data for real-time streaming
-    /// 完全按照Python逻辑实现的滑动窗口处理
+    /// Process a frame of audio data for real-time streaming.
+    ///
+    /// 与 FileProcessor 对齐的正确实现：
+    ///   FileProcessor 在音频首尾各填充 384 个零样本（3帧），
+    ///   然后跳过前 384 个输出样本（BlockLen - BlockShift）。
+    ///   这意味着模型先用 3 帧零信号"预热"，前 3 帧的输出对应零输入，需丢弃。
+    ///
+    ///   RuntimeProcessor 在初始化时 buffer 已为全零（ResetStates），
+    ///   因此只需：
+    ///     1. 每帧正常更新 buffer 并推理（包括前 3 帧）
+    ///     2. 前 3 帧的输出（对应 zero-padding 区域）丢弃，返回静音
+    ///     3. 第 4 帧起返回真实输出
+    ///   这样模型状态与 FileProcessor 完全同步。
     /// </summary>
-    /// <param name="micFrame">Microphone audio frame (must be BlockShift samples)</param>
-    /// <param name="lpbFrame">Loudspeaker audio frame (must be BlockShift samples)</param>
-    /// <returns>Processed audio frame (BlockShift samples)</returns>
+    /// <param name="micFrame">Microphone audio frame (must be BlockShift=128 samples)</param>
+    /// <param name="lpbFrame">Loudspeaker audio frame (must be BlockShift=128 samples)</param>
+    /// <returns>Processed audio frame (BlockShift samples)；前3帧为静音（预热期）</returns>
     public float[] ProcessFrame(float[] micFrame, float[] lpbFrame)
     {
         if (micFrame.Length != BlockShift || lpbFrame.Length != BlockShift)
@@ -131,32 +142,28 @@ public class RuntimeProcessor
             return new float[BlockShift];
         }
 
-        // 前3帧作为padding（模拟Python的初始padding）
-        if (_isPaddingPhase)
-        {
-            _paddingFramesReceived++;
-            if (_paddingFramesReceived >= PaddingFrames)
-            {
-                _isPaddingPhase = false;
-            }
-            // padding阶段返回静音
-            return new float[BlockShift];
-        }
-
-        // === 滑动窗口更新（与Python完全一致） ===
+        // === 滑动窗口更新（与 Python / FileProcessor 完全一致） ===
         // Python: in_buffer[:-block_shift] = in_buffer[block_shift:]
         Array.Copy(_inputBuffer, BlockShift, _inputBuffer, 0, BlockLen - BlockShift);
         Array.Copy(_lpbBuffer, BlockShift, _lpbBuffer, 0, BlockLen - BlockShift);
 
-        // Python: in_buffer[-block_shift:] = audio[idx * block_shift : (idx * block_shift) + block_shift]
+        // Python: in_buffer[-block_shift:] = new_samples
         Array.Copy(micFrame, 0, _inputBuffer, BlockLen - BlockShift, BlockShift);
         Array.Copy(lpbFrame, 0, _lpbBuffer, BlockLen - BlockShift, BlockShift);
 
-        // === 处理完整的block ===
+        // === 推理 ===
         ProcessBlock(_inputBuffer, _lpbBuffer);
 
-        // === 提取输出（从overlap-add buffer的前BlockShift个样本） ===
-        // Python: out_file[idx * block_shift : (idx * block_shift) + block_shift] = out_buffer[:block_shift]
+        // === 输出延迟补偿 ===
+        // 前 PaddingFrames（3）帧的推理输出对应 zero-padding 输入区域，
+        // 与 FileProcessor 丢弃 outFile[0..383] 的行为一致，返回静音。
+        if (_outputDelayFrames < PaddingFrames)
+        {
+            _outputDelayFrames++;
+            return new float[BlockShift];
+        }
+
+        // === 提取有效输出 ===
         float[] outputFrame = new float[BlockShift];
         Array.Copy(_outputBuffer, 0, outputFrame, 0, BlockShift);
 
@@ -314,5 +321,5 @@ public class RuntimeProcessor
 
     // Properties for monitoring
     public int FramesProcessed => _framesProcessed;
-    public bool IsPaddingPhase => _isPaddingPhase;
+    public bool IsWarmingUp => _outputDelayFrames < PaddingFrames;
 }

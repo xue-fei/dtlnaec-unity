@@ -8,3 +8,9 @@ Temp
 *.csproj
 .vs
 obj
+Assets/aec_out.wav
+Assets/aec_out.wav.meta
+Assets/lpb_raw.wav
+Assets/lpb_raw.wav.meta
+Assets/mic_raw.wav
+Assets/mic_raw.wav.meta
