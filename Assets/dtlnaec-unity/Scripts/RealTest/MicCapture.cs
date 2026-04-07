@@ -17,14 +17,24 @@ using UnityEngine.Networking;
 ///      - aec_out.wav    AEC 处理后的干净语音
 ///
 /// 修复记录：
-///   Bug - ReadLoopbackFrameRaw 用 WritePos-PendingSamples 计算 readPos：
-///         LoopbackCapture.WritePos 由音频线程均匀递增，
-///         MicCapture 由 Update() 驱动帧率不均匀，一个 Update 帧内
-///         while 循环消耗 N 个 BLOCK，但每次都取"当前最新"的 WritePos-128，
-///         导致同一段 loopback 数据被重复读取（实测重复率约 49%），
-///         写入 lpb_raw.wav 后播放音调偏低、断续不正常。
-///   Fix  - 增加独立的 _lastLpbPos 顺序追踪 LoopbackCapture 读取位置，
+///   Bug1 - ReadLoopbackFrameRaw 用 WritePos-PendingSamples 计算 readPos：
+///          LoopbackCapture.WritePos 由音频线程均匀递增，
+///          MicCapture 由 Update() 驱动帧率不均匀，一个 Update 帧内
+///          while 循环消耗 N 个 BLOCK，但每次都取"当前最新"的 WritePos-128，
+///          导致同一段 loopback 数据被重复读取（实测重复率约 49%），
+///          写入 lpb_raw.wav 后播放音调偏低、断续不正常。
+///   Fix1 - 增加独立的 _lastLpbPos 顺序追踪 LoopbackCapture 读取位置，
 ///          每消耗一帧就前进 BLOCK_SHIFT，保证每帧 loopback 数据只读一次。
+///
+///   Bug2 - 未播放音频时 LoopbackCapture.WritePos 接近 0，
+///          _lastLpbPos = WritePos - initDelay 结果为负数。
+///          C# 取模（%）对负数返回负值，用作数组索引时抛出
+///          IndexOutOfRangeException。
+///   Fix2 - 初始化时将 _lastLpbPos 夹紧为非负（Math.Max(0, ...)）；
+///          ReadLoopbackFrameRaw 中使用防负数取模公式
+///          ((x % n) + n) % n；
+///          ProcessAvailableFrames 中对负数 _lastLpbPos 做快进修正，
+///          使读指针尽快追上写指针后再正常消费。
 /// </summary>
 public class MicCapture : MonoBehaviour
 {
@@ -53,7 +63,7 @@ public class MicCapture : MonoBehaviour
     // ── 对齐模块 ─────────────────────────────────────────────────────────────
     private AlignedLoopbackReader _lpbReader;
 
-    // ✅ 修复核心：独立追踪 LoopbackCapture 环形缓冲的读取位置
+    // ✅ Fix1：独立追踪 LoopbackCapture 环形缓冲的读取位置
     // 不再依赖 WritePos 实时值，每消耗一帧就顺序前进 BLOCK_SHIFT
     private int _lastLpbPos = 0;
     private bool _lpbPosInitialized = false;
@@ -113,10 +123,10 @@ public class MicCapture : MonoBehaviour
                 // 启动麦克风
                 _micClip = Microphone.Start(null, true, 10, SAMPLE_RATE);
 
-                // ✅ 与 LoopbackCapture 写指针对齐：从当前写入位置开始读
-                // 同时退后一个初始延迟量，让 AlignedLoopbackReader 有足够历史可 Pull
+                // ✅ Fix2：与 LoopbackCapture 写指针对齐，退后初始延迟量。
+                // 若 WritePos 尚小（未播放音频时），夹紧为 0，避免负数索引崩溃。
                 int initDelay = 80 * SAMPLE_RATE / 1000;  // 80ms = 1280 samples
-                _lastLpbPos = LoopbackCapture.WritePos - initDelay;
+                _lastLpbPos = Math.Max(0, LoopbackCapture.WritePos - initDelay);
                 _lpbPosInitialized = true;
 
                 Debug.Log("[MicCapture] 启动完成");
@@ -185,6 +195,16 @@ public class MicCapture : MonoBehaviour
 
         while (available >= BLOCK_SHIFT)
         {
+            // ── Fix2：_lastLpbPos 为负时（WritePos 起始很小导致的遗留负值），
+            // 快进到 max(0, WritePos - initDelay) 后再做正常的可用量判断，
+            // 避免负数传入 ReadLoopbackFrameRaw 的取模运算。
+            if (_lastLpbPos < 0)
+            {
+                int initDelay = 80 * SAMPLE_RATE / 1000;
+                _lastLpbPos = Math.Max(0, LoopbackCapture.WritePos - initDelay);
+                Debug.LogWarning($"[MicCapture] _lastLpbPos 为负，已修正为 {_lastLpbPos}");
+            }
+
             // ── 安全检查：loopback 写入是否已追上 ──────────────────────────
             // 若 loopback 写指针落后于我们要读的位置，本次 while 循环暂停
             // （音频线程还没写够一帧，等下一个 Update）
@@ -195,7 +215,7 @@ public class MicCapture : MonoBehaviour
             float[] micFrame = new float[BLOCK_SHIFT];
             _micClip.GetData(micFrame, _lastMicPos);
 
-            // 2. ✅ 顺序读取 loopback，_lastLpbPos 每帧递增 BLOCK_SHIFT，不重复不跳帧
+            // 2. ✅ Fix1：顺序读取 loopback，_lastLpbPos 每帧递增 BLOCK_SHIFT，不重复不跳帧
             float[] rawLpb = ReadLoopbackFrameRaw();
 
             // 3. 推入延迟环形缓冲
@@ -226,10 +246,14 @@ public class MicCapture : MonoBehaviour
     /// <summary>
     /// 从 LoopbackCapture 环形缓冲顺序读取 BLOCK_SHIFT 个样本。
     ///
-    /// ✅ 修复：使用独立的 _lastLpbPos 追踪读取位置，每帧前进 BLOCK_SHIFT。
+    /// ✅ Fix1：使用独立的 _lastLpbPos 追踪读取位置，每帧前进 BLOCK_SHIFT。
     ///    原来用 WritePos - PendingSamples - BLOCK_SHIFT 计算 readPos，
     ///    在 Update 帧率不均匀时会将同一帧重复读取 N 次（实测重复率 ~49%），
     ///    导致 lpb_raw.wav 播放音调偏低、断续。
+    ///
+    /// ✅ Fix2：取模使用 ((x % n) + n) % n 防御负数索引。
+    ///    C# 的 % 对负数操作数返回负值，直接用于数组索引会抛
+    ///    IndexOutOfRangeException。
     /// </summary>
     float[] ReadLoopbackFrameRaw()
     {
@@ -238,7 +262,9 @@ public class MicCapture : MonoBehaviour
 
         for (int i = 0; i < BLOCK_SHIFT; i++)
         {
-            int idx = (_lastLpbPos + i) % bufSize;
+            // ✅ Fix2：防负数取模，保证索引始终在 [0, bufSize) 范围内
+            int raw = (_lastLpbPos + i) % bufSize;
+            int idx = (raw + bufSize) % bufSize;
             frame[i] = LoopbackCapture.LoopbackBuffer[idx];
         }
 
