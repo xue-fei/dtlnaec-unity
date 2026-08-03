@@ -71,11 +71,13 @@ public class MicCapture : MonoBehaviour
     // GCC-PHAT 校准：每积累 CALIB_FRAMES 个 sample 估计一次延迟
     private const int CALIB_FRAMES = 4096;  // ~256ms @16kHz
     private const int RECALIB_INTERVAL = 500;   // 锁定后每 500 帧重新校准（~4s）
+    private const float CONFIDENCE_THRESHOLD = 2.0f;  // v2: 置信度阈值，低于此值拒绝更新
 
     private float[] _micAccum;
     private float[] _lpbAccum;
     private int _accumPos = 0;
     private int _recalibCount = 0;
+    private int _rejectedCount = 0;  // v2: 被拒绝的校准次数统计
 
     // ── 生命周期 ──────────────────────────────────────────────────────────────
 
@@ -276,6 +278,8 @@ public class MicCapture : MonoBehaviour
     /// <summary>
     /// 累积 mic / lpb 样本，每满 CALIB_FRAMES 触发一次 GCC-PHAT 估计。
     /// 锁定后每 RECALIB_INTERVAL 帧解锁一次以应对设备变化。
+    ///
+    /// v2 优化：置信度校验 — 静音/噪声时拒绝校准，防止错误偏移
     /// </summary>
     void RunCalibration(float[] micFrame, float[] lpbFrame)
     {
@@ -301,10 +305,25 @@ public class MicCapture : MonoBehaviour
         {
             int lagDelta = DelayEstimator.Estimate(
                 _micAccum, _lpbAccum,
-                maxLagSamples: SAMPLE_RATE * 300 / 1000
+                maxLagSamples: SAMPLE_RATE * 300 / 1000,
+                out float confidence
             );
-            //Debug.LogWarning("lagDelta:"+ lagDelta);
-            _lpbReader.UpdateDelay(_lpbReader.CurrentDelaySamples + lagDelta);
+
+            // v2: 置信度校验 — 静音/噪声时拒绝校准
+            if (confidence < CONFIDENCE_THRESHOLD)
+            {
+                _rejectedCount++;
+                if (_rejectedCount % 10 == 1)
+                {
+                    Debug.LogWarning($"[MicCapture] 校准置信度过低 ({confidence:F2} < {CONFIDENCE_THRESHOLD})，跳过更新");
+                }
+            }
+            else
+            {
+                _lpbReader.UpdateDelay(_lpbReader.CurrentDelaySamples + lagDelta);
+                _rejectedCount = 0;
+            }
+
             _accumPos = 0;
         }
     }

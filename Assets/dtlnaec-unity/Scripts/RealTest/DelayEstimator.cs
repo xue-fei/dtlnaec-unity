@@ -3,6 +3,11 @@ using System;
 /// <summary>
 /// GCC-PHAT 延迟估计器（FFT O(N log N) 实现）
 /// 无需第三方库，纯 C# + Unity 可用
+/// 
+/// v2 优化：
+///   1. FFT 前加 Hanning 窗，降低频谱泄漏
+///   2. 输出置信度（peak-to-mean ratio），供调用方拒绝劣质估计
+///   3. 窗系数预计算复用
 /// </summary>
 public static class DelayEstimator
 {
@@ -32,24 +37,28 @@ public static class DelayEstimator
     /// <param name="mic">近端麦克风信号</param>
     /// <param name="lpb">远端 loopback 参考信号（与 mic 等长）</param>
     /// <param name="maxLagSamples">搜索范围上限（samples），建议设为采样率 × 最大延迟秒数</param>
-    public static int Estimate(float[] mic, float[] lpb, int maxLagSamples = 4800)
+    /// <param name="confidence">输出置信度（peak-to-mean ratio），&lt;2.0 视为不可靠</param>
+    public static int Estimate(float[] mic, float[] lpb, int maxLagSamples, out float confidence)
     {
-        int n = mic.Length;                    // 输入长度（如 4096）
-        int fftSize = NextPow2(2 * n - 1);    // 线性卷积所需：补零到 2N
+        int n = mic.Length;
+        int fftSize = NextPow2(2 * n - 1);
 
         Complex[] X = ToComplex(mic, fftSize);
         Complex[] Y = ToComplex(lpb, fftSize);
+
+        // v2: Hanning 窗降低频谱泄漏
+        ApplyHanningWindow(X, n);
+        ApplyHanningWindow(Y, n);
 
         // 正向 FFT
         FFT(X, false);
         FFT(Y, false);
 
-        // 互功率谱 + PHAT 白化：每个 bin 除以幅度（只保留相位）
+        // 互功率谱 + PHAT 白化
         for (int k = 0; k < fftSize; k++)
         {
-            Complex cross = Complex.MulConj(X[k], Y[k]);  // X × conj(Y)
+            Complex cross = Complex.MulConj(X[k], Y[k]);
             float mag = cross.Mag;
-            // 避免除零；幅度极小的 bin 置零（抑制噪声分量）
             X[k] = mag > 1e-10f ? new Complex(cross.R / mag, cross.I / mag)
                                 : new Complex(0, 0);
         }
@@ -58,24 +67,85 @@ public static class DelayEstimator
         FFT(X, true);
 
         // 在 [-maxLag, +maxLag] 内找峰值
-        // GCC-PHAT 输出：正延迟在 [0, maxLag]，负延迟在 [fftSize-maxLag, fftSize-1]
         int clampedLag = Math.Min(maxLagSamples, fftSize / 2 - 1);
         float bestVal = float.MinValue;
         int bestLag = 0;
 
-        // 正延迟段 [0 .. maxLag]
+        // 正延迟段
         for (int i = 0; i <= clampedLag; i++)
         {
             if (X[i].R > bestVal) { bestVal = X[i].R; bestLag = i; }
         }
 
-        // 负延迟段 [fftSize - maxLag .. fftSize - 1]
+        // 负延迟段
         for (int i = fftSize - clampedLag; i < fftSize; i++)
         {
             if (X[i].R > bestVal) { bestVal = X[i].R; bestLag = i - fftSize; }
         }
 
+        // v2: 计算置信度 = 峰值 / 均值（排除峰值附近 ±5 bins）
+        confidence = CalculateConfidence(X, clampedLag, fftSize, bestLag);
+
         return bestLag;
+    }
+
+    /// <summary>
+    /// 重载：兼容旧调用方（不输出置信度）
+    /// </summary>
+    public static int Estimate(float[] mic, float[] lpb, int maxLagSamples = 4800)
+    {
+        return Estimate(mic, lpb, maxLagSamples, out _);
+    }
+
+    // ── 置信度计算 ──────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// peak-to-mean ratio：峰值相对于均值的倍数。
+    /// 高置信度（&gt;3.0）表示相关峰尖锐；低置信度（&lt;2.0）表示无明显峰（静音/噪声）
+    /// </summary>
+    private static float CalculateConfidence(Complex[] gcc, int clampedLag, int fftSize, int bestLag)
+    {
+        int excludeRadius = 5;
+        float peak = gcc[bestLag >= 0 ? bestLag : bestLag + fftSize].R;
+
+        float sum = 0f;
+        int count = 0;
+
+        // 正延迟段
+        for (int i = 0; i <= clampedLag; i++)
+        {
+            if (Math.Abs(i - bestLag) <= excludeRadius) continue;
+            sum += gcc[i].R;
+            count++;
+        }
+
+        // 负延迟段
+        for (int i = fftSize - clampedLag; i < fftSize; i++)
+        {
+            int lag = i - fftSize;
+            if (Math.Abs(lag - bestLag) <= excludeRadius) continue;
+            sum += gcc[i].R;
+            count++;
+        }
+
+        if (count == 0 || peak <= 0f) return 0f;
+
+        float mean = sum / count;
+        return mean > 1e-10f ? peak / mean : 0f;
+    }
+
+    // ── Hanning 窗 ───────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// 对前 n 个元素施加 Hanning 窗（原地修改）
+    /// </summary>
+    private static void ApplyHanningWindow(Complex[] buf, int n)
+    {
+        for (int i = 0; i < n; i++)
+        {
+            float w = 0.5f - 0.5f * MathF.Cos(2f * MathF.PI * i / (n - 1));
+            buf[i] = new Complex(buf[i].R * w, buf[i].I * w);
+        }
     }
 
     // ── Cooley-Tukey 基 2 FFT（迭代，无递归开销）───────────────────────────
@@ -131,7 +201,6 @@ public static class DelayEstimator
         int copyLen = Math.Min(src.Length, targetLen);
         for (int i = 0; i < copyLen; i++)
             buf[i] = new Complex(src[i], 0);
-        // 超出部分自动补零（C# 默认初始化为 0）
         return buf;
     }
 
