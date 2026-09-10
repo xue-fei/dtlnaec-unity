@@ -3,7 +3,14 @@ using System;
 /// <summary>
 /// GCC-PHAT 延迟估计器（FFT O(N log N) 实现）
 /// 无需第三方库，纯 C# + Unity 可用
-/// 
+///
+/// v3 优化：
+///   1. 信号能量门控：任一通道 RMS 过低（静音/噪声）时直接返回 0 + 低置信度，
+///      避免 PHAT 白化把噪声放大成虚假相关峰。
+///   2. 置信度改用 peak-to-RMS（原为 peak-to-mean，有符号求和会正负抵消
+///      导致比值爆炸到数百甚至负数）。
+///   3. PHAT 白化加相对 eps 正则化，避免噪声频点被放大到 1。
+///
 /// v2 优化：
 ///   1. FFT 前加 Hanning 窗，降低频谱泄漏
 ///   2. 输出置信度（peak-to-mean ratio），供调用方拒绝劣质估计
@@ -41,6 +48,19 @@ public static class DelayEstimator
     public static int Estimate(float[] mic, float[] lpb, int maxLagSamples, out float confidence)
     {
         int n = mic.Length;
+
+        // ── v3: 信号能量门控 ──
+        // 任一通道 RMS 过低（静音/纯噪声）时，GCC-PHAT 会白化放大噪声，
+        // 产生虚假相关峰。此时直接返回 0 延迟 + 低置信度，不进入 FFT。
+        float micRms = Rms(mic);
+        float lpbRms = Rms(lpb);
+        const float MIN_RMS = 1e-3f; // 约 -60 dBFS
+        if (micRms < MIN_RMS || lpbRms < MIN_RMS)
+        {
+            confidence = 0f;
+            return 0;
+        }
+
         int fftSize = NextPow2(2 * n - 1);
 
         Complex[] X = ToComplex(mic, fftSize);
@@ -54,13 +74,21 @@ public static class DelayEstimator
         FFT(X, false);
         FFT(Y, false);
 
-        // 互功率谱 + PHAT 白化
+        // 互功率谱 + PHAT 白化（v3: 相对 eps 正则化，避免噪声放大）
+        float refMag = 0f;
+        for (int k = 0; k < fftSize; k++)
+        {
+            float m = MathF.Abs(X[k].R) + MathF.Abs(X[k].I);
+            if (m > refMag) refMag = m;
+        }
+        float eps = refMag * 1e-6f + 1e-12f;
+
         for (int k = 0; k < fftSize; k++)
         {
             Complex cross = Complex.MulConj(X[k], Y[k]);
             float mag = cross.Mag;
-            X[k] = mag > 1e-10f ? new Complex(cross.R / mag, cross.I / mag)
-                                : new Complex(0, 0);
+            X[k] = mag > eps ? new Complex(cross.R / mag, cross.I / mag)
+                             : new Complex(0, 0);
         }
 
         // 逆 FFT → GCC-PHAT 相关序列
@@ -83,10 +111,21 @@ public static class DelayEstimator
             if (X[i].R > bestVal) { bestVal = X[i].R; bestLag = i - fftSize; }
         }
 
-        // v2: 计算置信度 = 峰值 / 均值（排除峰值附近 ±5 bins）
+        // v3: 计算置信度 = 峰值 / RMS（排除峰值附近 ±5 bins），避免有符号求和爆炸
         confidence = CalculateConfidence(X, clampedLag, fftSize, bestLag);
 
         return bestLag;
+    }
+
+    /// <summary>
+    /// 信号均方根（RMS），用于静音/噪声门控。
+    /// </summary>
+    private static float Rms(float[] x)
+    {
+        double sumSq = 0;
+        for (int i = 0; i < x.Length; i++)
+            sumSq += (double)x[i] * x[i];
+        return (float)Math.Sqrt(sumSq / x.Length);
     }
 
     /// <summary>
@@ -100,22 +139,28 @@ public static class DelayEstimator
     // ── 置信度计算 ──────────────────────────────────────────────────────────
 
     /// <summary>
-    /// peak-to-mean ratio：峰值相对于均值的倍数。
+    /// peak-to-RMS ratio：峰值相对于均方根的倍数。
     /// 高置信度（&gt;3.0）表示相关峰尖锐；低置信度（&lt;2.0）表示无明显峰（静音/噪声）
+    ///
+    /// v3: 改用 RMS（均方根）而非有符号求和。GCC-PHAT 相关序列围绕 0 正负振荡，
+    ///     有符号 sum 会正负抵消趋近 0，导致 peak/mean 爆炸到数百甚至负数。
+    ///     RMS 恒为正，能稳定反映相关序列的"本底水平"。
     /// </summary>
     private static float CalculateConfidence(Complex[] gcc, int clampedLag, int fftSize, int bestLag)
     {
         int excludeRadius = 5;
         float peak = gcc[bestLag >= 0 ? bestLag : bestLag + fftSize].R;
 
-        float sum = 0f;
+        if (peak <= 0f) return 0f;
+
+        double sumSq = 0;
         int count = 0;
 
         // 正延迟段
         for (int i = 0; i <= clampedLag; i++)
         {
             if (Math.Abs(i - bestLag) <= excludeRadius) continue;
-            sum += gcc[i].R;
+            sumSq += (double)gcc[i].R * gcc[i].R;
             count++;
         }
 
@@ -124,14 +169,14 @@ public static class DelayEstimator
         {
             int lag = i - fftSize;
             if (Math.Abs(lag - bestLag) <= excludeRadius) continue;
-            sum += gcc[i].R;
+            sumSq += (double)gcc[i].R * gcc[i].R;
             count++;
         }
 
-        if (count == 0 || peak <= 0f) return 0f;
+        if (count == 0) return 0f;
 
-        float mean = sum / count;
-        return mean > 1e-10f ? peak / mean : 0f;
+        float rms = (float)Math.Sqrt(sumSq / count);
+        return rms > 1e-10f ? peak / rms : 0f;
     }
 
     // ── Hanning 窗 ───────────────────────────────────────────────────────────

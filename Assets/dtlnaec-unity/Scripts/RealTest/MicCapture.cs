@@ -69,15 +69,34 @@ public class MicCapture : MonoBehaviour
     private bool _lpbPosInitialized = false;
 
     // GCC-PHAT 校准：每积累 CALIB_FRAMES 个 sample 估计一次延迟
-    private const int CALIB_FRAMES = 4096;  // ~256ms @16kHz
+    private const int CALIB_FRAMES = 8192;  // v3: 512ms @16kHz，更大窗口减少静音段比例，延迟估计更稳定
     private const int RECALIB_INTERVAL = 500;   // 锁定后每 500 帧重新校准（~4s）
-    private const float CONFIDENCE_THRESHOLD = 2.0f;  // v2: 置信度阈值，低于此值拒绝更新
+    private const float CONFIDENCE_THRESHOLD = 2.0f;  // 置信度阈值，低于此值拒绝更新
 
     private float[] _micAccum;
     private float[] _lpbAccum;
     private int _accumPos = 0;
     private int _recalibCount = 0;
     private int _rejectedCount = 0;  // v2: 被拒绝的校准次数统计
+
+    // ── 对齐质量监控 ────────────────────────────────────────────────────────
+    // 实时追踪 GCC-PHAT 置信度、估计延迟与残差，周期性输出质量报告。
+    private const float MONITOR_INTERVAL_SEC = 2.0f;   // 每 2 秒打印一次质量快照
+    private const float CONFIDENCE_GOOD = 3.0f;        // 置信度 > 3.0 视为"对齐良好"
+    private float _monitorTimer = 0f;
+
+    // 累积统计（用于报告周期内的均值）
+    private int _monitorCalibCount = 0;      // 本周期内成功校准次数
+    private float _monitorConfSum = 0f;      // 本周期置信度累加
+    private float _monitorConfMin = float.MaxValue;
+    private int _monitorRejected = 0;        // 本周期被拒绝次数
+    private float _monitorResidualSum = 0f;  // 本周期残差累加（对齐后残余延迟）
+    private float _monitorResidualMax = 0f;
+
+    // 当前瞬时值（供外部/Inspector 查询）
+    public float LastConfidence { get; private set; } = 0f;
+    public float LastResidualMs { get; private set; } = 0f;
+    public float AlignmentScore { get; private set; } = 0f;  // 0~100 对齐质量分
 
     // ── 生命周期 ──────────────────────────────────────────────────────────────
 
@@ -140,6 +159,64 @@ public class MicCapture : MonoBehaviour
     void Update()
     {
         if (_init) ProcessAvailableFrames();
+        UpdateAlignmentMonitor();
+    }
+
+    /// <summary>
+    /// 对齐质量监控：周期性汇总 GCC-PHAT 置信度、残差等指标，
+    /// 计算对齐质量分并输出报告，异常时告警。
+    /// </summary>
+    void UpdateAlignmentMonitor()
+    {
+        _monitorTimer += Time.deltaTime;
+        if (_monitorTimer < MONITOR_INTERVAL_SEC) return;
+        _monitorTimer = 0f;
+
+        if (_monitorCalibCount == 0)
+        {
+            // 本周期没有成功校准：要么尚未锁定（预热），要么全被拒绝（远端静音）
+            return;
+        }
+
+        float avgConf = _monitorConfSum / _monitorCalibCount;
+        float avgResidualMs = (_monitorResidualSum / _monitorCalibCount) * 1000f / SAMPLE_RATE;
+
+        // 质量评分：置信度贡献 60%，残差贡献 40%
+        // confidence 映射：<2.0 → 0，>6.0 → 满分
+        float confScore = Mathf.InverseLerp(2.0f, 6.0f, avgConf);
+        // residual 映射：0ms → 满分，>30ms → 0 分
+        float residualScore = 1f - Mathf.InverseLerp(0f, 30f, avgResidualMs);
+        AlignmentScore = (confScore * 0.6f + residualScore * 0.4f) * 100f;
+
+        string state = _lpbReader.IsLocked ? "锁定" : "校准中";
+        string quality;
+        if (AlignmentScore >= 80f) quality = "优秀";
+        else if (AlignmentScore >= 60f) quality = "良好";
+        else if (AlignmentScore >= 40f) quality = "一般";
+        else quality = "差";
+
+        Debug.Log(
+            $"[对齐监控] 状态={state} | 质量分={AlignmentScore:F0}({quality}) | " +
+            $"置信度均值={avgConf:F2}(min={_monitorConfMin:F2}) | " +
+            $"残差均值={avgResidualMs:F2}ms(峰值={_monitorResidualMax * 1000f / SAMPLE_RATE:F2}ms) | " +
+            $"成功校准={_monitorCalibCount} 拒绝={_monitorRejected}"
+        );
+
+        if (AlignmentScore < 40f)
+        {
+            Debug.LogWarning(
+                "[对齐监控] ⚠️ 对齐质量差，可能原因：远端未播放声音(loopback静音)、" +
+                "延迟估计漂移、或麦克风/loopback 时序错位。请检查 mic_raw/lpb_raw 波形是否重合。"
+            );
+        }
+
+        // 重置周期累积
+        _monitorCalibCount = 0;
+        _monitorConfSum = 0f;
+        _monitorConfMin = float.MaxValue;
+        _monitorRejected = 0;
+        _monitorResidualSum = 0f;
+        _monitorResidualMax = 0f;
     }
 
     IEnumerator CopyModel(string sourcePath, string destPath, Action<bool> action = null)
@@ -311,10 +388,16 @@ public class MicCapture : MonoBehaviour
                 out float confidence
             );
 
+            // ── 对齐监控采集：无论接受与否都记录置信度 ──
+            LastConfidence = confidence;
+            _monitorConfSum += confidence;
+            if (confidence < _monitorConfMin) _monitorConfMin = confidence;
+
             // v2: 置信度校验 — 静音/噪声时拒绝校准
             if (confidence < CONFIDENCE_THRESHOLD)
             {
                 _rejectedCount++;
+                _monitorRejected++;
                 if (_rejectedCount % 10 == 1)
                 {
                     Debug.LogWarning($"[MicCapture] 校准置信度过低 ({confidence:F2} < {CONFIDENCE_THRESHOLD})，跳过更新");
@@ -322,8 +405,22 @@ public class MicCapture : MonoBehaviour
             }
             else
             {
-                _lpbReader.UpdateDelay(_lpbReader.CurrentDelaySamples + lagDelta);
+                // v3 修复：lagDelta 是 GCC-PHAT 在「原始 loopback」与 mic 之间
+                // 测出的【绝对延迟】，不是增量。旧代码误把绝对延迟当增量叠加
+                // （CurrentDelaySamples + lagDelta），导致延迟值被反复累加、残差
+                // 永远等于完整延迟无法收敛。
+                int prevDelay = _lpbReader.CurrentDelaySamples;
+                _lpbReader.UpdateDelay(lagDelta);
+
+                // 残差 = 新旧延迟估计之差，对齐收敛后应趋近 0
+                float residual = Mathf.Abs(_lpbReader.CurrentDelaySamples - prevDelay);
                 _rejectedCount = 0;
+
+                // ── 监控采集：记录残差与成功校准 ──
+                LastResidualMs = residual * 1000f / SAMPLE_RATE;
+                _monitorResidualSum += residual;
+                if (residual > _monitorResidualMax) _monitorResidualMax = residual;
+                _monitorCalibCount++;
             }
 
             _accumPos = 0;
