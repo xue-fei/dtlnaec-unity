@@ -227,7 +227,9 @@ public class MicCapture : MonoBehaviour
             float[] lpbAligned = _lpbReader.Pull(BLOCK_SHIFT);
 
             // 5. GCC-PHAT 自适应校准
-            RunCalibration(micFrame, lpbAligned);
+            //    v3：用「原始未补偿的 loopback」估计延迟，避免用已对齐数据
+            //        校准自己形成反馈循环（对齐值会污染延迟估计）。
+            RunCalibration(micFrame, rawLpb);
 
             // 6. AEC 推理
             float[] aecOut = _aec.ProcessFrame(micFrame, lpbAligned);

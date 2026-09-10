@@ -38,6 +38,19 @@ public class RuntimeProcessor
     private float[] _lpbBuffer = new float[BlockLen];
     private float[] _outputBuffer = new float[BlockLen];
 
+    // ── 预分配复用缓冲（减少每帧 GC 分配）──────────────────────────────────
+    private float[] _outputFrame = new float[BlockShift];
+    private Complex[] _inBlockFft = new Complex[FftHalfSize];
+    private Complex[] _lpbBlockFft = new Complex[FftHalfSize];
+    private Complex[] _fullSpectrum = new Complex[FftSize];
+    private Complex[] _complexInput = new Complex[FftSize];
+    private float[] _estimatedBlockTime = new float[FftSize];
+    private DenseTensor<float> _inMag;
+    private DenseTensor<float> _lpbMag;
+    private DenseTensor<float> _estimatedBlockTensor;
+    private DenseTensor<float> _inLpbTensor;
+    private bool _buffersReady = false;
+
     // Frame counter for tracking processing state
     private int _framesProcessed = 0;
 
@@ -108,6 +121,17 @@ public class RuntimeProcessor
 
         _framesProcessed = 0;
         _outputDelayFrames = 0;
+        _buffersReady = false;
+    }
+
+    private void EnsureBuffers()
+    {
+        if (_buffersReady) return;
+        _inMag = new DenseTensor<float>(dimensions: new[] { 1, 1, FftHalfSize });
+        _lpbMag = new DenseTensor<float>(dimensions: new[] { 1, 1, FftHalfSize });
+        _estimatedBlockTensor = new DenseTensor<float>(dimensions: new[] { 1, 1, BlockLen });
+        _inLpbTensor = new DenseTensor<float>(dimensions: new[] { 1, 1, BlockLen });
+        _buffersReady = true;
     }
 
     /// <summary>
@@ -142,6 +166,8 @@ public class RuntimeProcessor
             return new float[BlockShift];
         }
 
+        EnsureBuffers();
+
         // === 滑动窗口更新（与 Python / FileProcessor 完全一致） ===
         // Python: in_buffer[:-block_shift] = in_buffer[block_shift:]
         Array.Copy(_inputBuffer, BlockShift, _inputBuffer, 0, BlockLen - BlockShift);
@@ -160,15 +186,15 @@ public class RuntimeProcessor
         if (_outputDelayFrames < PaddingFrames)
         {
             _outputDelayFrames++;
-            return new float[BlockShift];
+            Array.Clear(_outputFrame, 0, BlockShift);
+            return _outputFrame;
         }
 
         // === 提取有效输出 ===
-        float[] outputFrame = new float[BlockShift];
-        Array.Copy(_outputBuffer, 0, outputFrame, 0, BlockShift);
+        Array.Copy(_outputBuffer, 0, _outputFrame, 0, BlockShift);
 
         _framesProcessed++;
-        return outputFrame;
+        return _outputFrame;
     }
 
     /// <summary>
@@ -178,11 +204,11 @@ public class RuntimeProcessor
     {
         // 处理最后的padding帧
         List<float> finalOutput = new List<float>();
+        float[] zeroFrame = new float[BlockShift];
 
         // 输出剩余的PaddingFrames帧
         for (int i = 0; i < PaddingFrames; i++)
         {
-            float[] zeroFrame = new float[BlockShift];
             float[] output = ProcessFrame(zeroFrame, zeroFrame);
             finalOutput.AddRange(output);
         }
@@ -192,25 +218,22 @@ public class RuntimeProcessor
 
     private void ProcessBlock(float[] inputBlock, float[] lpbBlock)
     {
-        // === 1. FFT计算 ===
-        var inBlockFft = PerformRfft(inputBlock);
-        var lpbBlockFft = PerformRfft(lpbBlock);
+        // === 1. FFT计算（复用缓冲） ===
+        PerformRfft(inputBlock, _inBlockFft);
+        PerformRfft(lpbBlock, _lpbBlockFft);
 
-        // === 2. 计算幅度谱 ===
-        var inMag = new DenseTensor<float>(dimensions: new[] { 1, 1, FftHalfSize });
-        var lpbMag = new DenseTensor<float>(dimensions: new[] { 1, 1, FftHalfSize });
-
+        // === 2. 计算幅度谱（复用 tensor） ===
         for (int i = 0; i < FftHalfSize; i++)
         {
-            inMag[0, 0, i] = (float)inBlockFft[i].Magnitude;
-            lpbMag[0, 0, i] = (float)lpbBlockFft[i].Magnitude;
+            _inMag[0, 0, i] = (float)_inBlockFft[i].Magnitude;
+            _lpbMag[0, 0, i] = (float)_lpbBlockFft[i].Magnitude;
         }
 
         // === 3. 运行Model 1 ===
         var inputs1 = new List<NamedOnnxValue>
         {
-            NamedOnnxValue.CreateFromTensor(_inputNames1[0], inMag),
-            NamedOnnxValue.CreateFromTensor(_inputNames1[2], lpbMag),
+            NamedOnnxValue.CreateFromTensor(_inputNames1[0], _inMag),
+            NamedOnnxValue.CreateFromTensor(_inputNames1[2], _lpbMag),
             NamedOnnxValue.CreateFromTensor(_inputNames1[1], _states1)
         };
 
@@ -223,30 +246,27 @@ public class RuntimeProcessor
             for (int i = 0; i < FftHalfSize; i++)
             {
                 float maskValue = outMask[0, 0, i];
-                inBlockFft[i] = new Complex(
-                    inBlockFft[i].Real * maskValue,
-                    inBlockFft[i].Imaginary * maskValue
+                _inBlockFft[i] = new Complex(
+                    _inBlockFft[i].Real * maskValue,
+                    _inBlockFft[i].Imaginary * maskValue
                 );
             }
         }
 
-        var estimatedBlockTime = PerformIrfft(inBlockFft);
+        var estimatedBlockTime = PerformIrfft(_inBlockFft);
 
-        // === 5. 准备Model 2的输入 ===
-        var estimatedBlockTensor = new DenseTensor<float>(dimensions: new[] { 1, 1, BlockLen });
-        var inLpbTensor = new DenseTensor<float>(dimensions: new[] { 1, 1, BlockLen });
-
+        // === 5. 准备Model 2的输入（复用 tensor） ===
         for (int i = 0; i < BlockLen; i++)
         {
-            estimatedBlockTensor[0, 0, i] = estimatedBlockTime[i];
-            inLpbTensor[0, 0, i] = lpbBlock[i];
+            _estimatedBlockTensor[0, 0, i] = estimatedBlockTime[i];
+            _inLpbTensor[0, 0, i] = lpbBlock[i];
         }
 
         // === 6. 运行Model 2 ===
         var inputs2 = new List<NamedOnnxValue>
         {
-            NamedOnnxValue.CreateFromTensor(_inputNames2[0], estimatedBlockTensor),
-            NamedOnnxValue.CreateFromTensor(_inputNames2[2], inLpbTensor),
+            NamedOnnxValue.CreateFromTensor(_inputNames2[0], _estimatedBlockTensor),
+            NamedOnnxValue.CreateFromTensor(_inputNames2[2], _inLpbTensor),
             NamedOnnxValue.CreateFromTensor(_inputNames2[1], _states2)
         };
 
@@ -270,45 +290,40 @@ public class RuntimeProcessor
         }
     }
 
-    private Complex[] PerformRfft(float[] input)
+    private void PerformRfft(float[] input, Complex[] result)
     {
-        var complexInput = new Complex[FftSize];
         for (int i = 0; i < FftSize; i++)
         {
-            complexInput[i] = new Complex(input[i], 0);
+            _complexInput[i] = new Complex(input[i], 0);
         }
 
-        Fourier.Forward(complexInput, FourierOptions.Matlab);
+        Fourier.Forward(_complexInput, FourierOptions.Matlab);
 
         // Return only the first half (N/2 + 1)
-        var result = new Complex[FftHalfSize];
-        Array.Copy(complexInput, result, FftHalfSize);
-
-        return result;
+        Array.Copy(_complexInput, result, FftHalfSize);
     }
 
     private float[] PerformIrfft(Complex[] input)
     {
         // Reconstruct the full spectrum for IFFT
-        var fullSpectrum = new Complex[FftSize];
-        Array.Copy(input, fullSpectrum, FftHalfSize);
+        Array.Clear(_fullSpectrum, 0, FftSize);
+        Array.Copy(input, _fullSpectrum, FftHalfSize);
 
         // Fill the second half with complex conjugates (for real signal)
         for (int i = 1; i < FftHalfSize - 1; i++)
         {
-            fullSpectrum[FftSize - i] = Complex.Conjugate(input[i]);
+            _fullSpectrum[FftSize - i] = Complex.Conjugate(input[i]);
         }
 
-        Fourier.Inverse(fullSpectrum, FourierOptions.Matlab);
+        Fourier.Inverse(_fullSpectrum, FourierOptions.Matlab);
 
-        // Return the real part of the result
-        var result = new float[FftSize];
+        // Return the real part of the result（复用 _estimatedBlockTime）
         for (int i = 0; i < FftSize; i++)
         {
-            result[i] = (float)fullSpectrum[i].Real;
+            _estimatedBlockTime[i] = (float)_fullSpectrum[i].Real;
         }
 
-        return result;
+        return _estimatedBlockTime;
     }
 
     public void Dispose()
