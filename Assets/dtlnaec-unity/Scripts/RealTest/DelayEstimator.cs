@@ -4,6 +4,10 @@ using System;
 /// GCC-PHAT 延迟估计器（FFT O(N log N) 实现）
 /// 无需第三方库，纯 C# + Unity 可用
 ///
+/// v5 优化：
+///   1. 语音频带加权：数字人语音能量集中在 300Hz~4kHz，白化时对带外频点
+///      按权重衰减，聚焦有效频段，相关峰更尖锐、抗噪声。
+///
 /// v3 优化：
 ///   1. 信号能量门控：任一通道 RMS 过低（静音/噪声）时直接返回 0 + 低置信度，
 ///      避免 PHAT 白化把噪声放大成虚假相关峰。
@@ -18,6 +22,14 @@ using System;
 /// </summary>
 public static class DelayEstimator
 {
+    // ── v5: 语音频带加权参数 ────────────────────────────────────────────────
+    // 数字人语音能量集中在 300Hz~4kHz，此范围外的频点主要是噪声/混响尾。
+    private const float SAMPLE_RATE = 16000f;
+    private const float SPEECH_LOW_HZ = 300f;     // 带通下限
+    private const float SPEECH_HIGH_HZ = 4000f;   // 带通上限
+    private const float SPEECH_BAND_MIN_WEIGHT = 0.05f;  // 带外频点保留的权重（非 0，避免完全丢弃）
+    private const float SPEECH_TRANSITION_HZ = 500f;    // 带通边缘过渡带宽（平滑衰减）
+
     // ── 复数结构 ────────────────────────────────────────────────────────────
 
     private struct Complex
@@ -83,11 +95,15 @@ public static class DelayEstimator
         }
         float eps = refMag * 1e-6f + 1e-12f;
 
+        // v5: 语音频带加权 —— 数字人语音能量集中在 300Hz~4kHz，高频段（>4kHz）
+        //     几乎全是噪声，PHAT 白化会把噪声放大成虚假相关峰，干扰延迟估计。
+        //     白化时对语音频带外的频点按权重衰减，让 GCC-PHAT 聚焦有效频段。
         for (int k = 0; k < fftSize; k++)
         {
             Complex cross = Complex.MulConj(X[k], Y[k]);
             float mag = cross.Mag;
-            X[k] = mag > eps ? new Complex(cross.R / mag, cross.I / mag)
+            float weight = SpeechBandWeight(k, fftSize);
+            X[k] = mag > eps ? new Complex(cross.R / mag * weight, cross.I / mag * weight)
                              : new Complex(0, 0);
         }
 
@@ -127,6 +143,45 @@ public static class DelayEstimator
             sumSq += (double)x[i] * x[i];
         return (float)Math.Sqrt(sumSq / x.Length);
     }
+
+    /// <summary>
+    /// v5: 语音频带加权 —— 返回频点 k 对应的权重，聚焦数字人语音能量集中的频段。
+    ///
+    /// 频点 k 对应物理频率 f = k * SAMPLE_RATE / fftSize。
+    /// 在 [SPEECH_LOW_HZ, SPEECH_HIGH_HZ] 内权重为 1，带外在过渡带内平滑衰减到
+    /// SPEECH_BAND_MIN_WEIGHT。这样 PHAT 白化时带外噪声频点被压低，相关峰更尖锐。
+    /// </summary>
+    private static float SpeechBandWeight(int k, int fftSize)
+    {
+        float freq = k * SAMPLE_RATE / fftSize;
+
+        // 高于奈奎斯特频率的频点（k > fftSize/2）在实信号 FFT 里是镜像，权重按正频率对称
+        if (freq > SAMPLE_RATE / 2f)
+        {
+            freq = SAMPLE_RATE - freq;
+        }
+
+        // 带内 → 权重 1
+        if (freq >= SPEECH_LOW_HZ && freq <= SPEECH_HIGH_HZ)
+            return 1f;
+
+        // 低频过渡带（0 → SPEECH_LOW_HZ）
+        if (freq < SPEECH_LOW_HZ)
+        {
+            float dist = SPEECH_LOW_HZ - freq;
+            float t = Clamp01(dist / SPEECH_TRANSITION_HZ);
+            return Lerp(1f, SPEECH_BAND_MIN_WEIGHT, t);
+        }
+
+        // 高频过渡带（SPEECH_HIGH_HZ → 奈奎斯特）
+        float distH = freq - SPEECH_HIGH_HZ;
+        float tH = Clamp01(distH / SPEECH_TRANSITION_HZ);
+        return Lerp(1f, SPEECH_BAND_MIN_WEIGHT, tH);
+    }
+
+    // 纯 C# 实现（避免引入 UnityEngine 依赖，保持本类可独立单测）
+    private static float Clamp01(float v) => v < 0f ? 0f : (v > 1f ? 1f : v);
+    private static float Lerp(float a, float b, float t) => a + (b - a) * t;
 
     /// <summary>
     /// 重载：兼容旧调用方（不输出置信度）

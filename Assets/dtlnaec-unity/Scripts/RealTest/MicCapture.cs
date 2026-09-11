@@ -70,13 +70,11 @@ public class MicCapture : MonoBehaviour
 
     // GCC-PHAT 校准：每积累 CALIB_FRAMES 个 sample 估计一次延迟
     private const int CALIB_FRAMES = 8192;  // v3: 512ms @16kHz，更大窗口减少静音段比例，延迟估计更稳定
-    private const int RECALIB_INTERVAL = 500;   // 锁定后每 500 帧重新校准（~4s）
     private const float CONFIDENCE_THRESHOLD = 2.0f;  // 置信度阈值，低于此值拒绝更新
 
     private float[] _micAccum;
     private float[] _lpbAccum;
     private int _accumPos = 0;
-    private int _recalibCount = 0;
     private int _rejectedCount = 0;  // v2: 被拒绝的校准次数统计
 
     // ── 对齐质量监控 ────────────────────────────────────────────────────────
@@ -356,75 +354,62 @@ public class MicCapture : MonoBehaviour
 
     /// <summary>
     /// 累积 mic / lpb 样本，每满 CALIB_FRAMES 触发一次 GCC-PHAT 估计。
-    /// 锁定后每 RECALIB_INTERVAL 帧解锁一次以应对设备变化。
     ///
-    /// v2 优化：置信度校验 — 静音/噪声时拒绝校准，防止错误偏移
+    /// v4: 锁定后不再停止校准，而是持续累积+估计，把新测得的【绝对延迟】
+    ///     交给 AlignedLoopbackReader 用极低权重微调（跟踪缓慢漂移）。
+    ///     静音帧由 Estimate 内部 RMS 门控拒绝，不影响已锁定的延迟。
+    ///
+    /// v2: 置信度校验 — 静音/噪声时拒绝校准，防止错误偏移
     /// </summary>
     void RunCalibration(float[] micFrame, float[] lpbFrame)
     {
-        if (_lpbReader.IsLocked)
-        {
-            _recalibCount++;
-            if (_recalibCount >= RECALIB_INTERVAL)
-            {
-                _lpbReader.Unlock();
-                _recalibCount = 0;
-                _accumPos = 0;
-                Debug.Log("[MicCapture] 延迟重新校准中...");
-            }
-            return;
-        }
-
+        // 累积样本（锁定前后都持续累积）
         int copy = Math.Min(BLOCK_SHIFT, CALIB_FRAMES - _accumPos);
         Array.Copy(micFrame, 0, _micAccum, _accumPos, copy);
         Array.Copy(lpbFrame, 0, _lpbAccum, _accumPos, copy);
         _accumPos += copy;
 
-        if (_accumPos >= CALIB_FRAMES)
+        if (_accumPos < CALIB_FRAMES) return;
+
+        int lagDelta = DelayEstimator.Estimate(
+            _micAccum, _lpbAccum,
+            maxLagSamples: SAMPLE_RATE * 300 / 1000,
+            out float confidence
+        );
+
+        // ── 对齐监控采集：无论接受与否都记录置信度 ──
+        LastConfidence = confidence;
+        _monitorConfSum += confidence;
+        if (confidence < _monitorConfMin) _monitorConfMin = confidence;
+
+        // 置信度校验 — 静音/噪声时拒绝校准
+        if (confidence < CONFIDENCE_THRESHOLD)
         {
-            int lagDelta = DelayEstimator.Estimate(
-                _micAccum, _lpbAccum,
-                maxLagSamples: SAMPLE_RATE * 300 / 1000,
-                out float confidence
-            );
-
-            // ── 对齐监控采集：无论接受与否都记录置信度 ──
-            LastConfidence = confidence;
-            _monitorConfSum += confidence;
-            if (confidence < _monitorConfMin) _monitorConfMin = confidence;
-
-            // v2: 置信度校验 — 静音/噪声时拒绝校准
-            if (confidence < CONFIDENCE_THRESHOLD)
+            _rejectedCount++;
+            _monitorRejected++;
+            if (_rejectedCount % 10 == 1)
             {
-                _rejectedCount++;
-                _monitorRejected++;
-                if (_rejectedCount % 10 == 1)
-                {
-                    Debug.LogWarning($"[MicCapture] 校准置信度过低 ({confidence:F2} < {CONFIDENCE_THRESHOLD})，跳过更新");
-                }
+                Debug.LogWarning($"[MicCapture] 校准置信度过低 ({confidence:F2} < {CONFIDENCE_THRESHOLD})，跳过更新");
             }
-            else
-            {
-                // v3 修复：lagDelta 是 GCC-PHAT 在「原始 loopback」与 mic 之间
-                // 测出的【绝对延迟】，不是增量。旧代码误把绝对延迟当增量叠加
-                // （CurrentDelaySamples + lagDelta），导致延迟值被反复累加、残差
-                // 永远等于完整延迟无法收敛。
-                int prevDelay = _lpbReader.CurrentDelaySamples;
-                _lpbReader.UpdateDelay(lagDelta);
-
-                // 残差 = 新旧延迟估计之差，对齐收敛后应趋近 0
-                float residual = Mathf.Abs(_lpbReader.CurrentDelaySamples - prevDelay);
-                _rejectedCount = 0;
-
-                // ── 监控采集：记录残差与成功校准 ──
-                LastResidualMs = residual * 1000f / SAMPLE_RATE;
-                _monitorResidualSum += residual;
-                if (residual > _monitorResidualMax) _monitorResidualMax = residual;
-                _monitorCalibCount++;
-            }
-
             _accumPos = 0;
+            return;
         }
+
+        // v4: lagDelta 是 GCC-PHAT 测出的【绝对延迟】，直接交给 UpdateDelay。
+        //     锁定前 UpdateDelay 用自适应权重收敛；锁定后用 ALPHA_FINE_TUNE 微调。
+        _lpbReader.UpdateDelay(lagDelta);
+        _rejectedCount = 0;
+
+        // 残差 = 本次测量值与更新后延迟之差（锁定后微调时趋近 0）
+        float residual = Mathf.Abs(lagDelta - _lpbReader.CurrentDelaySamples);
+
+        // ── 监控采集：记录残差与成功校准 ──
+        LastResidualMs = residual * 1000f / SAMPLE_RATE;
+        _monitorResidualSum += residual;
+        if (residual > _monitorResidualMax) _monitorResidualMax = residual;
+        _monitorCalibCount++;
+
+        _accumPos = 0;
     }
 
     // ── 录制控制 ──────────────────────────────────────────────────────────────

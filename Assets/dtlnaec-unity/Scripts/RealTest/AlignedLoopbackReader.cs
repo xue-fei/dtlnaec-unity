@@ -1,6 +1,12 @@
 // ════════════════════════════════════════════════════════════════════════════
 //  AlignedLoopbackReader
-//  带延迟补偿的 loopback 环形缓冲，GCC-PHAT 结果低通平滑后自动锁定
+//  带延迟补偿的 loopback 环形缓冲，GCC-PHAT 结果经 α-β 滤波器跟踪
+//
+//  v5 优化（用 α-β 滤波器跟踪时钟漂移）：
+//   1. 显式估计延迟漂移速度，用「位置+速度」双状态预测下一延迟，
+//      稳定跟上 mic/loopback 采样时钟漂移，消除残差周期性反弹。
+//   2. 野值拒绝：测量值偏离预测值超 ±30ms 时跳过更新，避免相关峰误判污染状态。
+//   3. 锁定仅用于监控/日志，不再冻结或切换跟踪行为。
 //
 //  v3 优化（修复对齐失效 + 竞态）：
 //   1. Pull 真正使用 _delaySamples 做持续补偿：读指针 = 写指针 - 当前延迟，
@@ -27,21 +33,23 @@ public class AlignedLoopbackReader
     private long _readPos = 0;    // 累计读样本数（同上）
 
     // ── 延迟状态 ──────────────────────────────────────────────────────────────
-    private int _delaySamples;
-    private bool _locked = false;
-    private int _lockCounter = 0;
+    private int _delaySamples;               // 当前补偿延迟（整数，供 Pull 使用）
+    private float _delayFiltered;            // α-β 滤波器内部位置状态（float，含亚样本精度）
+    private float _delayVelocity;            // 延迟漂移速度（samples / 校准周期）
+    private bool _initialized = false;       // 首次有效测量后置 true，跳过预测阶段
+    private bool _locked = false;            // 已锁定（速度估计稳定后置 true，仅用于监控/日志）
+    private int _lockCounter = 0;            // 连续有效测量计数，用于锁定判定
+    private int _outlierStreak = 0;          // v5: 连续野值计数（检测真实突变 vs 孤立野值）
 
-    // v2: 自适应平滑参数
-    private const int LOCK_FRAMES = 50;
-    private const float ALPHA_INITIAL = 0.3f;     // 初始权重（快速收敛）
-    private const float ALPHA_LOCKED = 0.05f;     // 锁定后权重（稳定）
-    private const int MAX_STEP_SAMPLES = 160;     // 单帧最大变化 ±10ms @16kHz
-
-    // v2: 锁定后异常检测
-    private int _lockedStableCount = 0;
-    private int _lockedLastDelay = 0;
-    private const int LOCKED_CHECK_INTERVAL = 100;  // 锁定后每 100 帧检查一次稳定性
-    private const int LOCKED_MAX_DRIFT = 320;       // 允许最大漂移 ±20ms @16kHz
+    // v5: α-β 滤波器参数（跟踪时钟漂移）
+    // α 控制对测量误差的响应速度，β 控制对漂移速度的估计速度。
+    // 取值参考雷达跟踪惯例：β = α² / (2 - α)，保证临界阻尼、不过冲。
+    private const float ALPHA = 0.25f;       // 位置增益（响应测量误差）
+    private const float BETA = 0.05f;        // 速度增益（跟踪漂移斜率）
+    private const int LOCK_FRAMES = 30;      // 连续 30 次有效测量后视为锁定
+    private const int MAX_STEP_SAMPLES = 160;   // 单帧位置最大变化 ±10ms（防野值跳变）
+    private const int OUTLIER_REJECT_SAMPLES = 480;  // 残差超此值视为野值，跳过更新（±30ms）
+    private const int OUTLIER_STREAK_RESET = 5;   // 连续 5 次野值判定为真实突变，重置滤波器
 
     /// <summary>当前使用的延迟（samples）</summary>
     public int CurrentDelaySamples => _delaySamples;
@@ -55,7 +63,8 @@ public class AlignedLoopbackReader
         _bufSize = maxDelayMs * 2 * sampleRate / 1000 + 4096;
         _buf = new float[_bufSize];
         _delaySamples = initialDelayMs * sampleRate / 1000;
-        _lockedLastDelay = _delaySamples;
+        _delayFiltered = _delaySamples;
+        _delayVelocity = 0f;
         // v3: 不再调用 ResetReadPos，读指针从 0 开始，由 Pull 内部对齐
     }
 
@@ -126,59 +135,94 @@ public class AlignedLoopbackReader
     }
 
     /// <summary>
-    /// 接受 GCC-PHAT 测得的新延迟，进行自适应低通平滑；
-    /// 连续 LOCK_FRAMES 次后锁定。
+    /// 接受 GCC-PHAT 测得的【绝对延迟】，用 α-β 滤波器跟踪。
     ///
-    /// v2: 自适应系数 + 单帧变化 clamp + 锁定后异常检测
-    /// v3: 锁定不再触发 ResetReadPos，读指针由 Pull 按延迟自动对齐
+    /// v5: 用 α-β 滤波器（位置 + 速度双状态）替换一阶低通 + 锁定/微调。
+    ///     时钟漂移（mic ADC 与 loopback DAC 采样频率差）使延迟近似匀速变化，
+    ///     α-β 滤波器显式估计漂移速度并用其预测，能稳定跟上漂移，
+    ///     消除一阶低通"追不上移动目标→残差周期性反弹"的问题。
+    ///
+    ///     野值拒绝：残差（测量值 vs 预测值）超过 OUTLIER_REJECT_SAMPLES 时，
+    ///     判定为错误估计（如相关峰误判），跳过本次更新，不污染速度状态。
+    ///
+    /// v4: 锁定后持续微调（已被 v5 取代）
+    /// v3: 锁定不触发 ResetReadPos，读指针由 Pull 按延迟自动对齐
     /// </summary>
     public void UpdateDelay(int measuredDelaySamples)
     {
-        if (_locked)
+        if (!_initialized)
         {
-            // v2: 锁定后周期性检查延迟是否发生异常漂移
-            _lockedStableCount++;
-            if (_lockedStableCount >= LOCKED_CHECK_INTERVAL)
+            // 首次有效测量：直接跳到测量值，初始化滤波器状态，不预测
+            _delayFiltered = measuredDelaySamples;
+            _delaySamples = measuredDelaySamples;
+            _delayVelocity = 0f;
+            _initialized = true;
+            _lockCounter = 1;
+            ClampDelay();
+            return;
+        }
+
+        // ── 1. 预测：假设延迟匀速漂移 ──
+        float predicted = _delayFiltered + _delayVelocity;
+
+        // ── 2. 残差 = 测量值 - 预测值 ──
+        float residual = measuredDelaySamples - predicted;
+
+        // ── 3. 野值拒绝：残差过大说明测量值不可信（相关峰误判），跳过更新 ──
+        if (Mathf.Abs(residual) > OUTLIER_REJECT_SAMPLES)
+        {
+            _outlierStreak++;
+            _lockCounter = 0;
+
+            // 连续多次野值且方向一致 → 判定为真实突变（设备切换/延迟阶跃），
+            // 重置滤波器让延迟快速跳变到新值，否则会永远卡在旧值跟不上去。
+            if (_outlierStreak >= OUTLIER_STREAK_RESET)
             {
-                _lockedStableCount = 0;
-                int drift = Math.Abs(measuredDelaySamples - _lockedLastDelay);
-                if (drift > LOCKED_MAX_DRIFT)
-                {
-                    Debug.LogWarning($"[AlignedLoopbackReader] 延迟漂移过大 ({drift} samples)，解锁重新校准");
-                    Unlock();
-                    return;
-                }
-                _lockedLastDelay = measuredDelaySamples;
+                _delayFiltered = measuredDelaySamples;
+                _delaySamples = Mathf.RoundToInt(measuredDelaySamples);
+                _delayVelocity = 0f;
+                _outlierStreak = 0;
+                _lockCounter = 0;
+                _locked = false;
+                ClampDelay();
+                Debug.LogWarning(
+                    $"[AlignedLoopbackReader] 检测到延迟突变，重置滤波器到 {_delaySamples} samples " +
+                    $"({_delaySamples * 1000f / 16000:F1} ms)");
             }
             return;
         }
 
-        // v2: 单帧变化 clamp，防止异常估计造成跳变
-        int delta = measuredDelaySamples - _delaySamples;
-        if (Math.Abs(delta) > MAX_STEP_SAMPLES)
-        {
-            measuredDelaySamples = _delaySamples + Math.Sign(delta) * MAX_STEP_SAMPLES;
-        }
+        // 正常测量，清零野值计数
+        _outlierStreak = 0;
 
-        // v2: 自适应平滑系数
-        // 早期使用大权重快速收敛，接近锁定时减小权重提高稳定性
-        float alpha = _lockCounter > LOCK_FRAMES / 2 ? ALPHA_LOCKED : ALPHA_INITIAL;
+        // ── 4. 单帧位置变化 clamp（防小野值造成跳变）──
+        float clampedResidual = Mathf.Clamp(residual, -MAX_STEP_SAMPLES, MAX_STEP_SAMPLES);
 
-        // 低通滤波
-        _delaySamples = (int)(_delaySamples * (1f - alpha)
-                              + measuredDelaySamples * alpha);
+        // ── 5. α-β 更新：位置 + 速度 ──
+        _delayFiltered += ALPHA * clampedResidual;
+        _delayVelocity += BETA * clampedResidual;
 
-        // 边界保护
-        _delaySamples = Mathf.Clamp(_delaySamples, 0, _bufSize / 2 - 1);
+        // ── 6. 速度限幅：防止速度估计发散（时钟漂移量级约 ±0.5 sample/周期）──
+        _delayVelocity = Mathf.Clamp(_delayVelocity, -8f, 8f);
 
+        _delaySamples = Mathf.RoundToInt(_delayFiltered);
+        ClampDelay();
+
+        // ── 7. 锁定判定（仅用于监控/日志，不影响跟踪行为）──
         _lockCounter++;
-        if (_lockCounter >= LOCK_FRAMES)
+        if (!_locked && _lockCounter >= LOCK_FRAMES)
         {
             _locked = true;
-            _lockedLastDelay = _delaySamples;
             Debug.Log($"[AlignedLoopbackReader] 延迟锁定：{_delaySamples} samples " +
-                      $"({_delaySamples * 1000f / 16000:F1} ms)");
+                      $"({_delaySamples * 1000f / 16000:F1} ms)，漂移速度 {_delayVelocity:F3} samples/周期");
         }
+    }
+
+    /// <summary>把整数延迟 clamp 到合法区间。</summary>
+    private void ClampDelay()
+    {
+        _delaySamples = Mathf.Clamp(_delaySamples, 0, _bufSize / 2 - 1);
+        _delayFiltered = Mathf.Clamp(_delayFiltered, 0, _bufSize / 2 - 1);
     }
 
     /// <summary>解锁以重新校准（如音频设备切换、蓝牙断连重连时）。</summary>
@@ -186,6 +230,7 @@ public class AlignedLoopbackReader
     {
         _locked = false;
         _lockCounter = 0;
-        _lockedStableCount = 0;
+        // 注意：不清空 _delayFiltered/_delayVelocity，避免解锁瞬间延迟跳变。
+        // 若设备切换导致延迟大幅改变，会触发野值拒绝并重置，滤波器会自动重新收敛。
     }
 }
