@@ -8,9 +8,9 @@ public class FileTest : MonoBehaviour
         FileProcessor dtlnaecProcessor = new FileProcessor();
         dtlnaecProcessor.Initialize(Application.streamingAssetsPath + "/dtln_aec_128_1.onnx",
             Application.streamingAssetsPath + "/dtln_aec_128_2.onnx");
-        float[] micData = Util.ReadWav(Application.dataPath + "/mic.wav");
-        float[] lpbData = Util.ReadWav(Application.dataPath + "/lpb.wav");
+        float[] micData = Util.ReadWav(Application.dataPath + "/mic_raw.wav");
+        float[] lpbData = Util.ReadWav(Application.dataPath + "/lpb_raw.wav");
         float[] data = dtlnaecProcessor.ProcessAudio(micData, lpbData);
-        Util.SaveClip(1, 16000, data, Application.dataPath + "/output.wav");
+        Util.SaveClip(1, 16000, data, Application.dataPath + "/aec_out.wav");
     }
 }

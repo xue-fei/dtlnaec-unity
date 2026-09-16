@@ -63,6 +63,11 @@ public class MicCapture : MonoBehaviour
     // ── 对齐模块 ─────────────────────────────────────────────────────────────
     private AlignedLoopbackReader _lpbReader;
 
+    // ── 延迟更新门控（远端 VAD + 双讲检测）──────────────────────────────────
+    // 只有「远端数字人在说话 且 无近端双讲」时才允许更新延迟，
+    // 避免静音/双讲时 GCC-PHAT 在噪声里瞎猜污染延迟跟踪。
+    private SpeechActivityGate _gate;
+
     // ✅ Fix1：独立追踪 LoopbackCapture 环形缓冲的读取位置
     // 不再依赖 WritePos 实时值，每消耗一帧就顺序前进 BLOCK_SHIFT
     private int _lastLpbPos = 0;
@@ -138,6 +143,9 @@ public class MicCapture : MonoBehaviour
                 // 校准累积缓冲
                 _micAccum = new float[CALIB_FRAMES];
                 _lpbAccum = new float[CALIB_FRAMES];
+
+                // 延迟更新门控
+                _gate = new SpeechActivityGate(SAMPLE_RATE, BLOCK_SHIFT);
 
                 // 启动麦克风
                 _micClip = Microphone.Start(null, true, 10, SAMPLE_RATE);
@@ -369,6 +377,11 @@ public class MicCapture : MonoBehaviour
         Array.Copy(lpbFrame, 0, _lpbAccum, _accumPos, copy);
         _accumPos += copy;
 
+        // ── 延迟更新门控：每帧更新远端 VAD / 双讲状态 ──
+        // 即使本帧不触发校准（_accumPos 未满），也要持续喂门控，
+        // 让 VAD 的滞回状态机在时间上连续推进。
+        _gate.ProcessFrame(lpbFrame, micFrame);
+
         if (_accumPos < CALIB_FRAMES) return;
 
         int lagDelta = DelayEstimator.Estimate(
@@ -391,6 +404,25 @@ public class MicCapture : MonoBehaviour
             {
                 Debug.LogWarning($"[MicCapture] 校准置信度过低 ({confidence:F2} < {CONFIDENCE_THRESHOLD})，跳过更新");
             }
+            _accumPos = 0;
+            return;
+        }
+
+        // ── 门控：远端无语音 或 双讲 时冻结延迟更新 ──
+        // GCC-PHAT 靠「mic 回声 vs loopback」相关性测延迟，远端静音时无参考、
+        // 双讲时 mic 混入近端语音，两种情况下测量值都不可信，跳过更新。
+        if (!_gate.AllowDelayUpdate)
+        {
+            _monitorRejected++;
+            // 周期性提示，避免刷屏
+            if (_rejectedCount % 10 == 1)
+            {
+                Debug.Log(
+                    $"[MicCapture] 门控拒绝延迟更新（远端语音={_gate.FarEndSpeech}，" +
+                    $"双讲={_gate.DoubleTalk}），保持当前延迟"
+                );
+            }
+            _rejectedCount++;
             _accumPos = 0;
             return;
         }
